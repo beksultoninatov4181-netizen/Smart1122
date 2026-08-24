@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+bot.env
+hisobot-eski-*.db
+*.db-wal
+*.db-shm

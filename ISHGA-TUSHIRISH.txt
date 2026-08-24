@@ -1,0 +1,59 @@
+💰 HISOB-KITOB BOTI v6
+═══════════════════════
+
+O'RNATISH
+─────────
+1. Ishlab turgan qora oynani yoping (Ctrl+C)
+2. Fayllarni eskisining ustiga qo'ying (bot.py, webapp.py, miniapp, *.bat)
+3. hisobot.db va bot.env ga TEGMANG
+4. ISHGA-TUSHIRISH.bat ni bosing
+5. Telegramda /start
+
+BIRINCHI KUNI QILINADIGAN ISHLAR
+─────────────────────────────────
+1. /zaxira        — bazangiz nusxasini oling, saqlab qo'ying
+2. ⚙️ Sozlamalar → 🔑 Kalit so'zlar — har biznesga so'z biriktiring
+                    (masalan Do'kon: savdo, tovar, kassa)
+3. /eslatma       — eslatma vaqtini sozlang (yoki o'chiring)
+
+YANGI IMKONIYATLAR
+──────────────────
+YOZISH
+  • Bitta xabarda bir nechta yozuv:
+        +450000 savdo
+        -80000 benzin
+        -200000 ustaga
+  • So'z bilan summa:   +ikki yuz ellik ming savdo
+  • O'tgan kunga:       kecha +450000 savdo
+                        19.08 -200000 ijara
+  • To'lov gapdan:      -80000 kartaga benzin   -> 💳 Karta
+                        -500000 qarzga tovar    -> 📝 Qarzga
+  • Kalit so'z:         -350000 zapchast oldim  -> 🏭 Avtoservis (so'ralmaydi)
+  • Tez tugmalar:       ➕ Kirim bosganda eng ko'p yozadiganlaringiz tugma bo'lib chiqadi
+
+TUZATISH
+  • Har yozuv ostida  ↩️ Bekor qilish  va  ✏️ Tahrirlash
+  • /tahrir 78        — summa, izoh, to'lov, biznes, kirim/chiqim
+  • /qidir zapchast   — izoh bo'yicha
+  • /qidir 450000     — summa bo'yicha
+
+ESLATMA (soat 20:00, o'zgartirsa bo'ladi)
+  • bugun yozuv bo'lmasa
+  • qarz muddati kelganda (qarz qo'shganda muddat yozing: 01.09)
+  • kassa bir haftadan beri tekshirilmasa
+
+HISOBOT
+  • Har raqam yonida o'tgan davr bilan farq:  ▲ +38%  /  ▼ −22%
+  • /kunlar    — qaysi hafta kuni kuchli
+  • /xarajat   — nimaga qancha ketgan (izohlar bo'yicha)
+
+XAVFSIZLIK
+  • Har kuni kun yakuni bilan birga baza nusxasi Telegramga keladi
+  • /zaxira    — istalgan vaqtda nusxa olish
+  • Kompyuter buzilsa: nusxani bot papkasiga hisobot.db nomi bilan qo'yasiz
+
+BARCHA BUYRUQLAR
+────────────────
+/yordam /kassa /hafta /yil /excel /ilova
+/tahrir /qidir /ochirish /kunlar /xarajat
+/zaxira /shubhali /hisobot /vaqt /eslatma /id
