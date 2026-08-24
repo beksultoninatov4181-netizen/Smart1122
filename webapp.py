@@ -22,7 +22,11 @@ from pathlib import Path
 
 log = logging.getLogger("miniapp")
 BASE = Path(__file__).resolve().parent
+# Odatda miniapp/ papkasida. Ba'zan (masalan brauzerdan yuklashda) fayllar
+# to'g'ridan-to'g'ri ildizga tushib qoladi — o'sha holatni ham qo'llab-quvvatlaymiz.
 STATIC = BASE / "miniapp"
+if not (STATIC / "index.html").exists() and (BASE / "index.html").exists():
+    STATIC = BASE
 
 # bot moduli (start() da beriladi)
 B = None
