@@ -100,6 +100,23 @@ def state_for(uid: int) -> dict:
         }
         if admin:
             item["kassa"] = B.kassa_holati(b["id"])
+
+        oy = B.oy_kaliti(bugun)
+        plan = B.reja_get(b["id"], oy)
+        jami_chiqim, toifalar = B.chiqim_oylik(b["id"], oy)
+        item["reja"] = {
+            "chegara": plan.get("", 0),
+            "sarflandi": jami_chiqim,
+            "toifalar": [
+                {"nomi": t, "reja": plan[t], "sarf": toifalar.get(t, 0)}
+                for t in B.TOIFALAR if t in plan
+            ],
+        }
+        item["xodimlar"] = [
+            {"nomi": u["nomi"], "rol": u["rol"]}
+            for u in B.users_all()
+            if u["rol"] == "admin" or u["biznes_id"] in (None, b["id"])
+        ]
         bizneslar.append(item)
 
     # oxirgi 7 kun — grafik uchun
@@ -112,15 +129,30 @@ def state_for(uid: int) -> dict:
             kun["biz"][str(b["id"])] = {"kirim": inc, "chiqim": exp}
         kunlar.append(kun)
 
+    # har bir yozuvdan keyingi kassa qoldig'i (o'sha biznes bo'yicha)
+    joriy = {}
+    if admin:
+        for b in bizlar:
+            k = B.kassa_holati(b["id"])
+            joriy[b["id"]] = k["Naqd"] + k["Karta"]
+
     oxirgi = []
     for r in B.tx_last(40, ids):
         oxirgi.append({
             "id": r["id"], "biznes_id": r["biznes_id"], "sana": r["sana"],
             "vaqt": r["vaqt"], "tur": r["tur"], "izoh": r["izoh"],
             "tolov": r["tolov"], "valyuta": r["valyuta"],
+            "karta": B.karta_nomi(r["karta_id"]) if (
+                r["tolov"] == "Karta" and (r["karta_id"] or 0)) else "",
             "summa": r["summa"], "summa_uzs": r["summa_uzs"],
+            "toifa": r["toifa"] or "",
             "kim": r["user_nomi"],
+            "qoldiq": joriy.get(r["biznes_id"]) if admin else None,
         })
+        # keyingi (eskiroq) yozuv uchun shu amalning ta'sirini olib tashlaymiz
+        if admin and r["biznes_id"] in joriy and r["tolov"] in ("Naqd", "Karta"):
+            joriy[r["biznes_id"]] -= (r["summa_uzs"] if r["tur"] == "Kirim"
+                                      else -r["summa_uzs"])
 
     qarzlar = []
     for d in B.debts_all(only_open=True):
@@ -131,9 +163,34 @@ def state_for(uid: int) -> dict:
                 "sana": d["sana"], "izoh": d["izoh"],
             })
 
+    muddatlar = []
+    for m in B.muddat_all(ids):
+        try:
+            kuni = date.fromisoformat(m["sana"])
+        except ValueError:
+            continue
+        muddatlar.append({
+            "id": m["id"], "biznes_id": m["biznes_id"], "nomi": m["nomi"],
+            "summa": m["summa"], "sana": m["sana"],
+            "kun": (kuni - bugun).days,
+        })
+
+    kartalar = []
+    if admin:
+        for k in B.karta_all():
+            q = B.karta_qoldiq(k["id"])
+            kartalar.append({
+                "id": k["id"], "nomi": k["nomi"],
+                "oxiri": (k["raqam"] or "")[-4:],
+                "qoldiq": q,
+            })
+
     return {
         "user": {"id": uid, "nomi": u["nomi"] if u else "", "admin": admin},
         "bizneslar": bizneslar,
+        "kartalar": kartalar,
+        "muddatlar": muddatlar,
+        "toifalar": B.TOIFALAR,
         "kunlar": kunlar,
         "oxirgi": oxirgi,
         "qarzlar": qarzlar,
@@ -170,6 +227,73 @@ def add_tx(uid: int, body: dict) -> dict:
     if B.is_admin(uid):
         out["kassa"] = B.kassa_holati(biz)
     return out
+
+
+def add_karta(uid: int, body: dict) -> dict:
+    if not B.is_admin(uid):
+        return {"error": "Faqat bot egasi karta qo'sha oladi"}
+    nomi = (body.get("nomi") or "").strip()[:40]
+    raqam = "".join(ch for ch in (body.get("raqam") or "") if ch.isdigit())[:20]
+    if not nomi:
+        return {"error": "Karta nomini kiriting"}
+    return {"ok": True, "id": B.karta_add(nomi, raqam)}
+
+
+def del_karta(uid: int, body: dict) -> dict:
+    if not B.is_admin(uid):
+        return {"error": "Faqat bot egasi"}
+    B.karta_ochir(int(body.get("id", 0)))
+    return {"ok": True}
+
+
+def add_muddat(uid: int, body: dict) -> dict:
+    if not B.is_admin(uid):
+        return {"error": "Faqat bot egasi qo'sha oladi"}
+    ids = [b["id"] for b in B.my_businesses(uid)]
+    biz = int(body.get("biznes_id", 0))
+    if biz not in ids:
+        return {"error": "Bu biznesga ruxsatingiz yo'q"}
+    nomi = (body.get("nomi") or "").strip()[:60]
+    try:
+        summa = float(body.get("summa", 0))
+        sana = date.fromisoformat((body.get("sana") or "").strip())
+    except (TypeError, ValueError):
+        return {"error": "Summa yoki sana noto'g'ri"}
+    if not nomi or summa <= 0:
+        return {"error": "Nomi va summani kiriting"}
+    return {"ok": True, "id": B.muddat_add(biz, nomi, summa, sana.isoformat())}
+
+
+def yop_muddat(uid: int, body: dict) -> dict:
+    if not B.is_admin(uid):
+        return {"error": "Faqat bot egasi"}
+    ids = [b["id"] for b in B.my_businesses(uid)]
+    mid = int(body.get("id", 0))
+    if not any(m["id"] == mid for m in B.muddat_all(ids, ochiq=False)):
+        return {"error": "Topilmadi"}
+    if body.get("ochir"):
+        B.muddat_ochir(mid)
+    else:
+        B.muddat_yop(mid)
+    return {"ok": True}
+
+
+def set_reja(uid: int, body: dict) -> dict:
+    if not B.is_admin(uid):
+        return {"error": "Faqat bot egasi rejani o'zgartira oladi"}
+    ids = [b["id"] for b in B.my_businesses(uid)]
+    biz = int(body.get("biznes_id", 0))
+    if biz not in ids:
+        return {"error": "Bu biznesga ruxsatingiz yo'q"}
+    toifa = (body.get("toifa") or "").strip()
+    if toifa and toifa not in B.TOIFALAR:
+        return {"error": "Bunday toifa yo'q"}
+    try:
+        summa = float(body.get("summa", 0))
+    except (TypeError, ValueError):
+        return {"error": "Summa noto'g'ri"}
+    B.reja_set(biz, B.oy_kaliti(), toifa, max(0.0, summa))
+    return {"ok": True}
 
 
 def del_tx(uid: int, body: dict) -> dict:
@@ -255,9 +379,16 @@ class Handler(BaseHTTPRequestHandler):
             if not uid:
                 self._json({"error": "auth"}, 401)
                 return
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            davr = (q.get("davr", ["hammasi"])[0] or "hammasi")
+            if davr not in ("oy", "otgan", "chorak", "yil", "hammasi"):
+                davr = "hammasi"
             ids = [b["id"] for b in B.my_businesses(uid)]
-            data = B.build_excel(ids, B.is_admin(uid))
-            nom = f"Hisob-kitob-{B.bugun():%Y-%m-%d}.xlsx"
+            biz_q = q.get("biz", [""])[0]
+            if biz_q.isdigit() and int(biz_q) in ids:
+                ids = [int(biz_q)]
+            data = B.build_excel(ids, B.is_admin(uid), davr)
+            nom = f"Hisob-kitob-{davr}-{B.bugun():%Y-%m-%d}.xlsx"
             self._send(200, data,
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        {"Content-Disposition": f'attachment; filename="{nom}"'})
@@ -291,6 +422,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(add_tx(uid, body))
             elif path == "/api/tx/delete":
                 self._json(del_tx(uid, body))
+            elif path == "/api/karta":
+                self._json(add_karta(uid, body))
+            elif path == "/api/karta/delete":
+                self._json(del_karta(uid, body))
+            elif path == "/api/muddat":
+                self._json(add_muddat(uid, body))
+            elif path == "/api/muddat/yop":
+                self._json(yop_muddat(uid, body))
+            elif path == "/api/reja":
+                self._json(set_reja(uid, body))
             else:
                 self._json({"error": "topilmadi"}, 404)
         except Exception as e:
