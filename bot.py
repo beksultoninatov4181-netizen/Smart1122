@@ -246,6 +246,31 @@ def init_db() -> None:
                 kalit TEXT PRIMARY KEY,
                 qiymat TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS reja (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                biznes_id INTEGER NOT NULL,
+                oy TEXT NOT NULL,              -- '2026-08'
+                toifa TEXT NOT NULL DEFAULT '',-- '' = umumiy chegara
+                summa REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS muddatlar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                biznes_id INTEGER NOT NULL,
+                nomi TEXT NOT NULL,
+                summa REAL NOT NULL,
+                sana TEXT NOT NULL,
+                holati TEXT DEFAULT 'Ochiq',
+                eslatildi TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS kartalar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nomi TEXT NOT NULL,
+                raqam TEXT DEFAULT '',
+                faol INTEGER DEFAULT 1
+            );
             """
         )
         c.execute("INSERT OR IGNORE INTO sozlamalar (kalit,qiymat) VALUES ('usd_kurs','12800')")
@@ -256,6 +281,8 @@ def init_db() -> None:
             ("qarzlar", "biznes_id", "INTEGER NOT NULL DEFAULT 1"),
             ("foydalanuvchilar", "biznes_id", "INTEGER"),
             ("qarzlar", "muddat", "TEXT"),
+            ("amaliyotlar", "karta_id", "INTEGER DEFAULT 0"),
+            ("amaliyotlar", "toifa", "TEXT DEFAULT ''"),
         ):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if column not in cols:
@@ -435,9 +462,10 @@ def tx_add(**k) -> int:
     with db() as c:
         cur = c.execute(
             "INSERT INTO amaliyotlar (biznes_id,sana,vaqt,user_id,user_nomi,tur,izoh,"
-            "tolov,valyuta,summa,summa_uzs) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "tolov,valyuta,summa,summa_uzs,karta_id,toifa) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (k["biznes_id"], k["sana"], k["vaqt"], k["user_id"], k["user_nomi"], k["tur"],
-             k["izoh"], k["tolov"], k["valyuta"], k["summa"], k["summa_uzs"]),
+             k["izoh"], k["tolov"], k["valyuta"], k["summa"], k["summa_uzs"],
+             int(k.get("karta_id") or 0), k.get("toifa", "")),
         )
         return cur.lastrowid
 
@@ -586,6 +614,124 @@ def kassa_holati(biz_id: int, kunga: str | None = None) -> dict[str, float]:
             if target_biz == biz_id and r["qayerga"] in bal:
                 bal[r["qayerga"]] += r["summa"]
     return bal
+
+
+# ---- kartalar ------------------------------------------------------------
+def karta_all(faqat_faol: bool = True) -> list[sqlite3.Row]:
+    with db() as c:
+        q = "SELECT * FROM kartalar"
+        if faqat_faol:
+            q += " WHERE faol=1"
+        return c.execute(q + " ORDER BY id").fetchall()
+
+
+def karta_get(kid: int) -> sqlite3.Row | None:
+    with db() as c:
+        return c.execute("SELECT * FROM kartalar WHERE id=?", (kid,)).fetchone()
+
+
+def karta_add(nomi: str, raqam: str = "") -> int:
+    with db() as c:
+        cur = c.execute("INSERT INTO kartalar (nomi,raqam) VALUES (?,?)",
+                        (nomi.strip(), raqam.strip()))
+        return cur.lastrowid
+
+
+def karta_ochir(kid: int) -> None:
+    with db() as c:
+        c.execute("UPDATE kartalar SET faol=0 WHERE id=?", (kid,))
+
+
+def karta_nomi(kid: int) -> str:
+    k = karta_get(kid)
+    if not k:
+        return "Karta"
+    oxiri = (k["raqam"] or "").strip()
+    return f"{k['nomi']} ·{oxiri[-4:]}" if oxiri else k["nomi"]
+
+
+def karta_qoldiq(kid: int, biz_id: int | None = None) -> float:
+    """Kartadagi qoldiq (so'm). biz_id berilsa faqat o'sha biznes bo'yicha."""
+    with db() as c:
+        q = ("SELECT tur,SUM(summa_uzs) s FROM amaliyotlar "
+             "WHERE tolov='Karta' AND karta_id=?")
+        args: list = [kid]
+        if biz_id:
+            q += " AND biznes_id=?"
+            args.append(biz_id)
+        bal = 0.0
+        for r in c.execute(q + " GROUP BY tur", args):
+            bal += r["s"] if r["tur"] == "Kirim" else -r["s"]
+    return bal
+
+
+# ---- xarajat toifalari, reja, to'lov muddatlari --------------------------
+TOIFALAR = ["Oylik", "Ijara", "Mahsulot", "Transport", "Soliq", "Boshqa"]
+
+
+def oy_kaliti(kun: dt.date | None = None) -> str:
+    k = kun or bugun()
+    return f"{k.year:04d}-{k.month:02d}"
+
+
+def reja_get(biz_id: int, oy: str) -> dict[str, float]:
+    """{'': umumiy chegara, 'Ijara': ...} — belgilanmaganlari yo'q."""
+    with db() as c:
+        rows = c.execute("SELECT toifa,summa FROM reja WHERE biznes_id=? AND oy=?",
+                         (biz_id, oy)).fetchall()
+    return {r["toifa"]: float(r["summa"]) for r in rows}
+
+
+def reja_set(biz_id: int, oy: str, toifa: str, summa: float) -> None:
+    with db() as c:
+        c.execute("DELETE FROM reja WHERE biznes_id=? AND oy=? AND toifa=?",
+                  (biz_id, oy, toifa))
+        if summa > 0:
+            c.execute("INSERT INTO reja (biznes_id,oy,toifa,summa) VALUES (?,?,?,?)",
+                      (biz_id, oy, toifa, summa))
+
+
+def chiqim_oylik(biz_id: int, oy: str) -> tuple[float, dict[str, float]]:
+    """Oydagi jami chiqim va toifalar kesimida."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT toifa, SUM(summa_uzs) s FROM amaliyotlar "
+            "WHERE biznes_id=? AND tur='Chiqim' AND substr(sana,1,7)=? GROUP BY toifa",
+            (biz_id, oy)).fetchall()
+    bo_yicha = {(r["toifa"] or "Boshqa"): float(r["s"]) for r in rows}
+    return sum(bo_yicha.values()), bo_yicha
+
+
+def muddat_all(biz_ids: list[int] | None = None, ochiq: bool = True) -> list[sqlite3.Row]:
+    with db() as c:
+        q = "SELECT * FROM muddatlar"
+        shart, args = [], []
+        if ochiq:
+            shart.append("holati='Ochiq'")
+        if biz_ids:
+            shart.append("biznes_id IN (%s)" % ",".join("?" * len(biz_ids)))
+            args += biz_ids
+        if shart:
+            q += " WHERE " + " AND ".join(shart)
+        return c.execute(q + " ORDER BY sana", args).fetchall()
+
+
+def muddat_add(biznes_id: int, nomi: str, summa: float, sana: str) -> int:
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO muddatlar (biznes_id,nomi,summa,sana) VALUES (?,?,?,?)",
+            (biznes_id, nomi.strip(), summa, sana))
+        return cur.lastrowid
+
+
+def muddat_yop(mid: int) -> None:
+    with db() as c:
+        c.execute("UPDATE muddatlar SET holati='Tolandi' WHERE id=?", (mid,))
+
+
+def muddat_ochir(mid: int) -> None:
+    with db() as c:
+        c.execute("DELETE FROM muddatlar WHERE id=?", (mid,))
 
 
 # ═══════════════════════════════════════════════════════ 3. YORDAMCHILAR
@@ -825,7 +971,26 @@ def debts_report(biz_ids: list[int]) -> str:
     return "\n".join(lines).strip()
 
 
-def build_excel(biz_ids: list[int], kassa_bilan: bool = True) -> bytes:
+def davr_oraligi(davr: str) -> tuple[str, str, str]:
+    """('oy'|'otgan'|'chorak'|'yil'|'hammasi') -> (boshi, oxiri, nomi)."""
+    k = bugun()
+    oxiri = k.isoformat()
+    if davr == "otgan":
+        oxirgi_kun = k.replace(day=1) - dt.timedelta(days=1)
+        return (oxirgi_kun.replace(day=1).isoformat(), oxirgi_kun.isoformat(),
+                f"{oxirgi_kun:%m.%Y}")
+    if davr == "chorak":
+        boshi = k - dt.timedelta(days=90)
+        return boshi.isoformat(), oxiri, "so'nggi 3 oy"
+    if davr == "yil":
+        return k.replace(month=1, day=1).isoformat(), oxiri, str(k.year)
+    if davr == "hammasi":
+        return "0001-01-01", oxiri, "hammasi"
+    return k.replace(day=1).isoformat(), oxiri, f"{k:%m.%Y}"
+
+
+def build_excel(biz_ids: list[int], kassa_bilan: bool = True,
+                davr: str = "hammasi") -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -840,27 +1005,89 @@ def build_excel(biz_ids: list[int], kassa_bilan: bool = True) -> bytes:
     bizneslar = [b for b in biz_all() if b["id"] in biz_ids]
     ranges: list[tuple[str, str, int, int]] = []   # varaq, nomi, oxirgi qator, biznes_id
 
+    d_boshi, d_oxiri, _ = davr_oraligi(davr)
+
     for b in bizneslar:
-        rows = tx_all(b["id"])
+        rows = (tx_all(b["id"]) if davr == "hammasi"
+                else tx_period(d_boshi, d_oxiri, b["id"]))
         safe = re.sub(r"[\\/*?:\[\]]", "-", b["nomi"])[:28] or f"Biznes {b['id']}"
         ws = wb.create_sheet(safe)
         heads = ["ID", "Sana", "Vaqt", "Kim yozdi", "Tur", "Izoh",
-                 "To'lov", "Valyuta", "Summa", "Summa (so'm)"]
-        for j, (h, w) in enumerate(zip(heads, [6, 12, 8, 18, 10, 34, 12, 9, 14, 16]), start=1):
+                 "To'lov", "Karta", "Toifa", "Valyuta", "Summa", "Summa (so'm)"]
+        for j, (h, w) in enumerate(
+                zip(heads, [6, 12, 8, 18, 10, 34, 12, 16, 13, 9, 14, 16]), start=1):
             c = ws.cell(row=1, column=j, value=h)
             c.font, c.fill = hfont, hf
             c.alignment = Alignment(horizontal="center", wrap_text=True)
             ws.column_dimensions[get_column_letter(j)].width = w
         ws.freeze_panes = "A2"
         for i, r in enumerate(rows, start=2):
+            karta = karta_nomi(r["karta_id"]) if (
+                r["tolov"] == "Karta" and (r["karta_id"] or 0)) else ""
             for j, v in enumerate([r["id"], r["sana"], r["vaqt"], r["user_nomi"], r["tur"],
-                                   r["izoh"], r["tolov"], r["valyuta"], r["summa"],
+                                   r["izoh"], r["tolov"], karta, r["toifa"] or "",
+                                   r["valyuta"], r["summa"],
                                    r["summa_uzs"]], start=1):
                 c = ws.cell(row=i, column=j, value=v)
                 c.font = body
-                if j in (9, 10):
+                if j in (11, 12):
                     c.number_format = money
         ranges.append((safe, b["nomi"], max(len(rows) + 1, 2), b["id"]))
+
+    # ---- reja / haqiqiy taqqoslama ----
+    oy = oy_kaliti()
+    rj = wb.create_sheet("Reja")
+    rj["A1"] = f"XARAJAT REJASI — {oy}"
+    rj["A1"].font = Font(name="Arial", bold=True, size=14, color="1F3864")
+    for j, (h, w) in enumerate(zip(["Biznes", "Toifa", "Reja (so'm)", "Haqiqiy (so'm)",
+                                    "Farq", "Bajarilishi"], [22, 16, 16, 16, 16, 14]), start=1):
+        c = rj.cell(row=3, column=j, value=h)
+        c.font, c.fill = hfont, hf
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+        rj.column_dimensions[get_column_letter(j)].width = w
+    r_row = 4
+    for b in bizneslar:
+        plan = reja_get(b["id"], oy)
+        if not plan:
+            continue
+        jami, bo_yicha = chiqim_oylik(b["id"], oy)
+        for toifa in [""] + TOIFALAR:
+            if toifa not in plan:
+                continue
+            haqiqiy = jami if toifa == "" else bo_yicha.get(toifa, 0)
+            rj.cell(row=r_row, column=1, value=b["nomi"]).font = body
+            rj.cell(row=r_row, column=2, value=toifa or "UMUMIY").font = body
+            rj.cell(row=r_row, column=3, value=round(plan[toifa])).number_format = money
+            rj.cell(row=r_row, column=4, value=round(haqiqiy)).number_format = money
+            c = rj.cell(row=r_row, column=5, value=f"=C{r_row}-D{r_row}")
+            c.number_format = money
+            c = rj.cell(row=r_row, column=6, value=f"=IF(C{r_row}=0,\"\",D{r_row}/C{r_row})")
+            c.number_format = "0%"
+            r_row += 1
+    if r_row == 4:
+        rj.cell(row=4, column=1, value="Reja belgilanmagan.").font = body
+
+    # ---- to'lov muddatlari ----
+    md = wb.create_sheet("Muddatlar")
+    md["A1"] = "TO'LOV MUDDATLARI"
+    md["A1"].font = Font(name="Arial", bold=True, size=14, color="1F3864")
+    for j, (h, w) in enumerate(zip(["Sana", "Biznes", "Nomi", "Summa (so'm)", "Holati"],
+                                   [13, 22, 26, 16, 12]), start=1):
+        c = md.cell(row=3, column=j, value=h)
+        c.font, c.fill = hfont, hf
+        md.column_dimensions[get_column_letter(j)].width = w
+    m_row = 4
+    for m in muddat_all(biz_ids, ochiq=False):
+        b = biz_get(m["biznes_id"])
+        md.cell(row=m_row, column=1, value=m["sana"]).font = body
+        md.cell(row=m_row, column=2, value=b["nomi"] if b else "").font = body
+        md.cell(row=m_row, column=3, value=m["nomi"]).font = body
+        c = md.cell(row=m_row, column=4, value=round(m["summa"]))
+        c.font, c.number_format = body, money
+        md.cell(row=m_row, column=5, value=m["holati"]).font = body
+        m_row += 1
+    if m_row == 4:
+        md.cell(row=4, column=1, value="Muddat qo'shilmagan.").font = body
 
     sm = wb.create_sheet("Xulosa", 0)
     sm["A1"] = "UMUMIY XULOSA"
@@ -879,8 +1106,8 @@ def build_excel(biz_ids: list[int], kassa_bilan: bool = True) -> bytes:
         q = "'" + safe.replace("'", "''") + "'"
         bal = kassa_holati(bid)
         sm.cell(row=row, column=1, value=nomi).font = Font(name="Arial", bold=True)
-        sm.cell(row=row, column=2, value=f'=SUMIFS({q}!$J$2:$J${last},{q}!$E$2:$E${last},"Kirim")')
-        sm.cell(row=row, column=3, value=f'=SUMIFS({q}!$J$2:$J${last},{q}!$E$2:$E${last},"Chiqim")')
+        sm.cell(row=row, column=2, value=f'=SUMIFS({q}!$L$2:$L${last},{q}!$E$2:$E${last},"Kirim")')
+        sm.cell(row=row, column=3, value=f'=SUMIFS({q}!$L$2:$L${last},{q}!$E$2:$E${last},"Chiqim")')
         sm.cell(row=row, column=4, value=f"=B{row}-C{row}")
         if kassa_bilan:
             sm.cell(row=row, column=5, value=round(bal["Naqd"]))
@@ -1146,6 +1373,25 @@ def grid(items: list[str], prefix: str, per_row: int = 2) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def toifa_kb() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, t in enumerate(TOIFALAR):
+        row.append(InlineKeyboardButton(text=t, callback_data=f"cat:{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def karta_kb(kartalar) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"💳 {karta_nomi(k['id'])}",
+                                  callback_data=f"card:{k['id']}")] for k in kartalar]
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def tolov_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💵 Naqd", callback_data="pay:0"),
@@ -1202,6 +1448,9 @@ def settings_kb(admin: bool) -> InlineKeyboardMarkup:
         rows += [
             [InlineKeyboardButton(text="🏢 Bizneslar", callback_data="biz_menu")],
             [InlineKeyboardButton(text="👥 Xodimlar", callback_data="users")],
+            [InlineKeyboardButton(text="💳 Kartalar", callback_data="karta_menu")],
+            [InlineKeyboardButton(text="🎯 Xarajat rejasi", callback_data="reja_menu")],
+            [InlineKeyboardButton(text="📅 To'lov muddatlari", callback_data="muddat_menu")],
             [InlineKeyboardButton(text="🔑 Kalit so'zlar", callback_data="kalitlar")],
             [InlineKeyboardButton(text="💱 USD kursi", callback_data="set_rate")],
             [InlineKeyboardButton(text="💾 Zaxira nusxa", callback_data="zaxira_ol")],
@@ -1226,6 +1475,7 @@ class TxForm(StatesGroup):
     amount = State()
     note = State()
     payment = State()
+    toifa = State()
 
 
 class QuickBiz(StatesGroup):
@@ -1265,6 +1515,18 @@ class BizForm(StatesGroup):
 
 class KalitForm(StatesGroup):
     sozlar = State()
+
+
+class KartaForm(StatesGroup):
+    nomi = State()
+
+
+class RejaForm(StatesGroup):
+    summa = State()
+
+
+class MuddatForm(StatesGroup):
+    matn = State()
 
 
 class KassaInit(StatesGroup):
@@ -1771,26 +2033,63 @@ async def st_note(message: Message, state: FSMContext):
 @dp.callback_query(TxForm.payment, F.data.startswith("pay:"))
 async def cb_payment(cb: CallbackQuery, state: FSMContext):
     payment = TOLOVLAR[int(cb.data.split(":")[1])]
+    kartalar = karta_all() if payment == "Karta" else []
+    if kartalar:
+        # qaysi kartadan — shu yerda so'raymiz
+        await state.update_data(payment=payment)
+        await cb.message.edit_text("Qaysi kartadan?", reply_markup=karta_kb(kartalar))
+        await cb.answer()
+        return
+    await state.update_data(payment=payment, karta_id=0)
+    await keyingi_qadam(cb, state)
+
+
+@dp.callback_query(TxForm.payment, F.data.startswith("card:"))
+async def cb_payment_card(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(karta_id=int(cb.data.split(":")[1]))
+    await keyingi_qadam(cb, state)
+
+
+async def keyingi_qadam(cb: CallbackQuery, state: FSMContext):
+    """Chiqim bo'lsa toifani so'raydi, aks holda darhol saqlaydi."""
+    data = await state.get_data()
+    if data.get("kind") == "Chiqim":
+        await state.set_state(TxForm.toifa)
+        await cb.message.edit_text("Xarajat toifasi:", reply_markup=toifa_kb())
+        await cb.answer()
+        return
+    await tugat(cb, state, "")
+
+
+@dp.callback_query(TxForm.toifa, F.data.startswith("cat:"))
+async def cb_toifa(cb: CallbackQuery, state: FSMContext):
+    await tugat(cb, state, TOIFALAR[int(cb.data.split(":")[1])])
+
+
+async def tugat(cb: CallbackQuery, state: FSMContext, toifa: str):
     data = await state.get_data()
     await state.clear()
     await cb.message.edit_text("💾 Saqlandi")
     await save_tx(cb.message, biznes_id=data["biznes_id"], kind=data["kind"],
                   amount=data["amount"], currency=data["currency"],
-                  note=data.get("note", ""), payment=payment,
-                  uid=cb.from_user.id, author=uname(cb))
+                  note=data.get("note", ""), payment=data.get("payment", "Naqd"),
+                  uid=cb.from_user.id, author=uname(cb),
+                  karta_id=int(data.get("karta_id") or 0), toifa=toifa)
     await cb.answer()
 
 
 async def save_tx(target: Message, biznes_id: int, kind, amount, currency, note, payment,
                   uid: int | None = None, author: str | None = None,
-                  sana: dt.date | None = None):
+                  sana: dt.date | None = None, karta_id: int = 0, toifa: str = ""):
     uzs = amount * rate() if currency == "USD" else amount
     now = hozir()
     kun = sana or now.date()
     tx_id = tx_add(biznes_id=biznes_id, sana=kun.isoformat(),
                    vaqt=now.strftime("%H:%M"), user_id=uid or target.chat.id,
                    user_nomi=author or uname(target), tur=kind, izoh=note, tolov=payment,
-                   valyuta=currency, summa=round(amount, 2), summa_uzs=round(uzs))
+                   valyuta=currency, summa=round(amount, 2), summa_uzs=round(uzs),
+                   karta_id=karta_id if payment == "Karta" else 0,
+                   toifa=toifa if kind == "Chiqim" else "")
     inc, exp = totals(tx_period(kun.isoformat(), kun.isoformat(), biznes_id))
     bal = kassa_holati(biznes_id)
     icon = "🟢" if kind == "Kirim" else "🔴"
@@ -1798,6 +2097,13 @@ async def save_tx(target: Message, biznes_id: int, kind, amount, currency, note,
     extra = f"  ({fmt(uzs)} so'm)" if currency == "USD" else ""
     tolov_str = {"Naqd": "💵 Naqd", "Karta": "💳 Karta",
                  "Qarzga": "📝 Qarzga (kassaga tegmadi)"}[payment]
+    if payment == "Karta" and karta_id:
+        k = karta_get(karta_id)
+        if k:
+            tolov_str = f"💳 {karta_nomi(karta_id)}"
+            qold = karta_qoldiq(karta_id)
+            tolov_str += (f"\n   qoldiq: {fmt(qold)} so'm"
+                          f" · ≈ ${qold / rate():,.2f}".replace(",", " "))
     yozuvchi = uid or target.chat.id
     kassa_qismi = ""
     if is_admin(yozuvchi):
@@ -1806,13 +2112,32 @@ async def save_tx(target: Message, biznes_id: int, kind, amount, currency, note,
             ogoh = f"\n⚠️ <b>{payment} kassa minusda</b> — yozuv tushib qolganmi?"
         kassa_qismi = (f"\n💰 <b>Kassa:</b> 💵 {fmt(bal['Naqd'])} · "
                        f"💳 {fmt(bal['Karta'])} so'm{ogoh}\n")
+    toifa_qismi = f"🏷 {toifa}\n" if (kind == "Chiqim" and toifa) else ""
+    reja_qismi = ""
+    if kind == "Chiqim":
+        oy = oy_kaliti(kun)
+        r = reja_get(biznes_id, oy)
+        if r:
+            jami, bo_yicha = chiqim_oylik(biznes_id, oy)
+            if "" in r:
+                foiz = jami / r[""] * 100 if r[""] else 0
+                belgi = "🔴" if foiz > 100 else ("🟡" if foiz >= 80 else "🟢")
+                reja_qismi += (f"{belgi} <b>Oylik reja:</b> {fmt(jami)} / {fmt(r[''])} "
+                               f"({foiz:.0f}%)\n")
+            if toifa and toifa in r:
+                sarf = bo_yicha.get(toifa, 0)
+                foiz = sarf / r[toifa] * 100 if r[toifa] else 0
+                belgi = "🔴" if foiz > 100 else ("🟡" if foiz >= 80 else "🟢")
+                reja_qismi += (f"{belgi} <b>{toifa}:</b> {fmt(sarf)} / {fmt(r[toifa])} "
+                               f"({foiz:.0f}%)\n")
     sana_qismi = "" if kun == bugun() else f"📅 <b>{kun:%d.%m.%Y}</b>\n"
     kun_nomi = "Bugun" if kun == bugun() else f"{kun:%d.%m}"
     await target.answer(
         f"{icon} <b>{kind} saqlandi</b>  <code>#{tx_id}</code>\n\n"
         f"🏢 {biz_name(biznes_id)}\n" + sana_qismi +
         f"💵 <b>{money}</b>{extra}\n"
-        f"{tolov_str}\n" + (f"📝 {note}\n" if note else "") + kassa_qismi +
+        f"{tolov_str}\n" + toifa_qismi + (f"📝 {note}\n" if note else "")
+        + kassa_qismi + reja_qismi +
         f"<i>{kun_nomi}: kirim {fmt(inc)} · chiqim {fmt(exp)} · foyda {fmt(inc - exp)}</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="↩️ Bekor qilish", callback_data=f"undo:{tx_id}"),
@@ -2674,6 +2999,248 @@ async def cb_last10(cb: CallbackQuery):
     await cb.answer()
 
 
+def _reja_qatori(nom: str, sarf: float, chegara: float) -> str:
+    foiz = sarf / chegara * 100 if chegara else 0
+    belgi = "🔴" if foiz > 100 else ("🟡" if foiz >= 80 else "🟢")
+    return f"{belgi} <b>{nom}</b>: {fmt(sarf)} / {fmt(chegara)} ({foiz:.0f}%)"
+
+
+@dp.callback_query(F.data == "reja_menu")
+async def cb_reja_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    oy = oy_kaliti()
+    lines = [f"🎯 <b>Xarajat rejasi</b> — {oy}", ""]
+    rows = []
+    for b in biz_all():
+        r = reja_get(b["id"], oy)
+        jami, bo_yicha = chiqim_oylik(b["id"], oy)
+        lines.append(f"{b['emoji']} <b>{b['nomi']}</b>")
+        if "" in r:
+            lines.append("   " + _reja_qatori("Umumiy", jami, r[""]))
+        else:
+            lines.append(f"   Umumiy chegara belgilanmagan · sarflandi {fmt(jami)}")
+        for t in TOIFALAR:
+            if t in r:
+                lines.append("   " + _reja_qatori(t, bo_yicha.get(t, 0), r[t]))
+        lines.append("")
+        rows.append([InlineKeyboardButton(text=f"✏️ {b['emoji']} {b['nomi']}",
+                                          callback_data=f"reja_biz:{b['id']}")])
+    await cb.message.answer("\n".join(lines).strip(),
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("reja_biz:"))
+async def cb_reja_biz(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    bid = int(cb.data.split(":")[1])
+    b = biz_get(bid)
+    rows = [[InlineKeyboardButton(text="💰 Umumiy oylik chegara",
+                                  callback_data=f"reja_set:{bid}:-1")]]
+    rows += [[InlineKeyboardButton(text=f"🏷 {t}", callback_data=f"reja_set:{bid}:{i}")]
+             for i, t in enumerate(TOIFALAR)]
+    await cb.message.answer(
+        f"{b['emoji']} <b>{b['nomi']}</b> — qaysi rejani o'zgartiramiz?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("reja_set:"))
+async def cb_reja_set(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    _, bid, idx = cb.data.split(":")
+    toifa = "" if int(idx) < 0 else TOIFALAR[int(idx)]
+    await state.set_state(RejaForm.summa)
+    await state.update_data(reja_biz=int(bid), reja_toifa=toifa)
+    nom = toifa or "Umumiy oylik chegara"
+    await cb.message.answer(
+        f"<b>{nom}</b> uchun summani yozing.\n\n"
+        "Masalan: <code>40000000</code> yoki <code>40 mln</code>\n"
+        "O'chirish uchun <code>0</code> yozing.  Bekor qilish: /bekor")
+    await cb.answer()
+
+
+@dp.message(RejaForm.summa, F.text)
+async def st_reja_summa(message: Message, state: FSMContext):
+    parsed = parse_amount(message.text)
+    if parsed is None:
+        await message.answer("Summani tushunmadim. Masalan: <code>40000000</code>")
+        return
+    summa = parsed[0] * rate() if parsed[1] == "USD" else parsed[0]
+    data = await state.get_data()
+    await state.clear()
+    bid, toifa = data["reja_biz"], data["reja_toifa"]
+    reja_set(bid, oy_kaliti(), toifa, summa)
+    nom = toifa or "Umumiy oylik chegara"
+    if summa > 0:
+        await message.answer(f"✅ <b>{nom}</b>: {fmt(summa)} so'm — saqlandi.")
+    else:
+        await message.answer(f"🗑 <b>{nom}</b> rejasi olib tashlandi.")
+
+
+@dp.callback_query(F.data == "muddat_menu")
+async def cb_muddat_menu(cb: CallbackQuery):
+    if not allowed(cb.from_user.id):
+        return
+    rows_db = muddat_all(my_ids(cb.from_user.id))
+    lines = ["📅 <b>To'lov muddatlari</b>", ""]
+    if rows_db:
+        for m in rows_db:
+            kun = dt.date.fromisoformat(m["sana"])
+            farq = (kun - bugun()).days
+            if farq < 0:
+                holat = f"🔴 {-farq} kun kechikdi"
+            elif farq == 0:
+                holat = "🟡 bugun"
+            elif farq == 1:
+                holat = "🟡 ertaga"
+            else:
+                holat = f"🟢 {farq} kundan keyin"
+            b = biz_get(m["biznes_id"])
+            lines.append(f"{holat}\n   <b>{m['nomi']}</b> · {fmt(m['summa'])} so'm")
+            lines.append(f"   {b['emoji'] if b else ''} {kun:%d.%m.%Y}")
+    else:
+        lines.append("Hozircha yo'q.")
+        lines.append("")
+        lines.append("Ijara, oylik, soliq kabi to'lovlarni sanasi bilan")
+        lines.append("qo'shsangiz, kuni kelganda eslataman.")
+    kb = [[InlineKeyboardButton(text=f"✅ {m['nomi']} — to'landi",
+                                callback_data=f"muddat_yop:{m['id']}")] for m in rows_db]
+    kb.append([InlineKeyboardButton(text="➕ Muddat qo'shish", callback_data="muddat_new")])
+    await cb.message.answer("\n".join(lines),
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "muddat_new")
+async def cb_muddat_new(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    await state.set_state(MuddatForm.matn)
+    await cb.message.answer(
+        "Bitta qatorda yozing: <b>nomi, summa, sana</b>\n\n"
+        "Masalan:\n"
+        "<code>Ijara 8000000 01.09</code>\n"
+        "<code>Soliq 3200000 15.09.2026</code>\n\n"
+        "Bekor qilish: /bekor")
+    await cb.answer()
+
+
+@dp.message(MuddatForm.matn, F.text)
+async def st_muddat(message: Message, state: FSMContext):
+    qismlar = message.text.strip().split()
+    if len(qismlar) < 3:
+        await message.answer("Format: <code>Ijara 8000000 01.09</code>")
+        return
+    sana_matn = qismlar[-1]
+    summa_matn = qismlar[-2]
+    nomi = " ".join(qismlar[:-2])
+    parsed = parse_amount(summa_matn)
+    if parsed is None:
+        await message.answer("Summani tushunmadim.")
+        return
+    summa = parsed[0] * rate() if parsed[1] == "USD" else parsed[0]
+    b = sana_matn.replace("/", ".").split(".")
+    try:
+        kun, oy = int(b[0]), int(b[1])
+        yil = int(b[2]) if len(b) > 2 else bugun().year
+        if yil < 100:
+            yil += 2000
+        sana = dt.date(yil, oy, kun)
+    except (ValueError, IndexError):
+        await message.answer("Sanani tushunmadim. Masalan: <code>01.09</code>")
+        return
+    bizlar = my_businesses(message.from_user.id)
+    bid = bizlar[0]["id"] if bizlar else 1
+    muddat_add(bid, nomi, summa, sana.isoformat())
+    await state.clear()
+    await message.answer(f"✅ <b>{nomi}</b> · {fmt(summa)} so'm\n"
+                         f"📅 {sana:%d.%m.%Y} — kuni kelganda eslataman.")
+
+
+@dp.callback_query(F.data.startswith("muddat_yop:"))
+async def cb_muddat_yop(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    muddat_yop(int(cb.data.split(":")[1]))
+    await cb.message.answer("✅ To'landi deb belgilandi.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "karta_menu")
+async def cb_karta_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    kartalar = karta_all()
+    lines = ["💳 <b>Kartalar</b>", ""]
+    if kartalar:
+        for k in kartalar:
+            q = karta_qoldiq(k["id"])
+            lines.append(f"💳 <b>{karta_nomi(k['id'])}</b>")
+            lines.append(f"   {fmt(q)} so'm · ≈ ${q / rate():.2f}")
+    else:
+        lines.append("Hali karta qo'shilmagan.")
+        lines.append("")
+        lines.append("Karta qo'shsangiz, har bir karta to'lovida")
+        lines.append("qaysi kartadan ekanini tanlaysiz.")
+    rows = [[InlineKeyboardButton(text=f"🗑 {karta_nomi(k['id'])}",
+                                  callback_data=f"karta_del:{k['id']}")] for k in kartalar]
+    rows.append([InlineKeyboardButton(text="➕ Karta qo'shish", callback_data="karta_new")])
+    await cb.message.answer("\n".join(lines),
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "karta_new")
+async def cb_karta_new(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    await state.set_state(KartaForm.nomi)
+    await cb.message.answer(
+        "Karta nomi va raqamini yozing.\n\n"
+        "Masalan: <code>Uzcard 8600123456781234</code>\n"
+        "yoki: <code>Humo 9860</code>\n\n"
+        "Bekor qilish: /bekor")
+    await cb.answer()
+
+
+@dp.message(KartaForm.nomi, F.text)
+async def st_karta_nomi(message: Message, state: FSMContext):
+    matn = message.text.strip()
+    raqamlar = "".join(ch for ch in matn if ch.isdigit())
+    nomi = "".join(ch for ch in matn if not ch.isdigit()).strip(" -·") or "Karta"
+    if not matn:
+        await message.answer("Nom yozing.")
+        return
+    karta_add(nomi, raqamlar)
+    await state.clear()
+    await message.answer(f"✅ Qo'shildi: <b>{nomi}</b>"
+                         + (f" ·{raqamlar[-4:]}" if raqamlar else ""))
+
+
+@dp.callback_query(F.data.startswith("karta_del:"))
+async def cb_karta_del(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Faqat bot egasi", show_alert=True)
+        return
+    kid = int(cb.data.split(":")[1])
+    nom = karta_nomi(kid)
+    karta_ochir(kid)
+    await cb.message.answer(f"🗑 <b>{nom}</b> ro'yxatdan olib tashlandi.\n"
+                            "<i>Eski yozuvlar o'zgarmaydi.</i>")
+    await cb.answer()
+
+
 @dp.callback_query(F.data == "biz_menu")
 async def cb_biz_menu(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -2919,7 +3486,8 @@ _MATN_KUTILADI = (
     Setup.names, TxForm.amount, TxForm.note, KassaInit.values, KassaCheck.amount,
     KassaMove.amount, DebtForm.who, DebtForm.amount, DebtForm.note, CloseDebt.debt_id,
     RateForm.value, AddUser.user_id, BizForm.new_name, BizForm.rename,
-    EditForm.summa, EditForm.izoh, KalitForm.sozlar,
+    EditForm.summa, EditForm.izoh, KalitForm.sozlar, KartaForm.nomi,
+    RejaForm.summa, MuddatForm.matn,
 )
 
 
@@ -3026,7 +3594,9 @@ async def matn_kerak(message: Message):
                          "Bekor qilish uchun /start yuboring.")
 
 
-@dp.message()
+# DIQQAT: bu handler buyruqlarni USHLAMASLIGI kerak — aks holda pastda
+# ro'yxatdan o'tgan /ilova, /zaxira, /qidir kabi buyruqlar ishlamay qoladi.
+@dp.message(~F.text.startswith("/"))
 async def fallback(message: Message):
     if not allowed(message.from_user.id):
         await message.answer(
@@ -3206,6 +3776,43 @@ async def eslatmalar(now: dt.datetime) -> None:
         royxat = ", ".join(f"{b['emoji']} {b['nomi']}" for b in bosh)
         xabarlar.append(f"📝 Bugun {royxat} bo'yicha yozuv yo'q — "
                         "savdo bo'lmadimi yoki unutildimi?")
+
+    # 1b) yaqinlashgan to'lov muddatlari
+    yaqin = []
+    for m in muddat_all():
+        try:
+            kuni = dt.date.fromisoformat(m["sana"])
+        except ValueError:
+            continue
+        farq = (kuni - now.date()).days
+        if farq > 3:
+            continue
+        b = biz_get(m["biznes_id"])
+        nom = f"{b['emoji']} {m['nomi']}" if b else m["nomi"]
+        if farq < 0:
+            yaqin.append(f"🔴 {nom} — {fmt(m['summa'])} so'm, {-farq} kun kechikdi")
+        elif farq == 0:
+            yaqin.append(f"🟡 {nom} — {fmt(m['summa'])} so'm, <b>bugun</b>")
+        else:
+            yaqin.append(f"🟢 {nom} — {fmt(m['summa'])} so'm, {farq} kundan keyin")
+    if yaqin:
+        xabarlar.append("📅 <b>To'lov muddatlari</b>\n" + "\n".join(yaqin))
+
+    # 1c) oylik xarajat rejasi chegaraga yaqinlashgan bizneslar
+    oy = oy_kaliti(now.date())
+    reja_ogoh = []
+    for b in biz_all():
+        r = reja_get(b["id"], oy)
+        if "" not in r or not r[""]:
+            continue
+        jami, _ = chiqim_oylik(b["id"], oy)
+        foiz = jami / r[""] * 100
+        if foiz >= 80:
+            belgi = "🔴" if foiz > 100 else "🟡"
+            reja_ogoh.append(f"{belgi} {b['emoji']} {b['nomi']} — "
+                             f"{fmt(jami)} / {fmt(r[''])} ({foiz:.0f}%)")
+    if reja_ogoh:
+        xabarlar.append("🎯 <b>Xarajat rejasi</b>\n" + "\n".join(reja_ogoh))
 
     # 2) qarz muddati bugun yoki o'tib ketgan
     kechikkanlar = []
@@ -3505,6 +4112,17 @@ async def cmd_ilova_manzil(message: Message):
         return
     cfg_set("webapp_url", parts[1].strip().rstrip("/"))
     await message.answer("✅ Manzil saqlandi. Endi /ilova tugmasi Telegram ichida ochiladi.")
+
+
+@dp.message(F.text.startswith("/"))
+async def notanish_buyruq(message: Message):
+    """Hamma buyruq handlerlaridan keyin turadi — noma'lum buyruqlar uchun."""
+    if not allowed(message.from_user.id):
+        await message.answer(
+            f"⛔️ Sizda ruxsat yo'q.\nSizning ID: <code>{message.from_user.id}</code>")
+        return
+    await message.answer("Bunday buyruq yo'q 🤔\nQo'llanma: /yordam",
+                         reply_markup=main_menu(message.from_user.id))
 
 
 def _bulut_domenini_yoz() -> None:
