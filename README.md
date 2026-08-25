@@ -140,3 +140,5 @@ Keyin `/ilova` — Telegram ichida ochiladigan tugma beradi.
 Telegram yuboradigan `initData` bot tokeni bilan tekshiriladi (HMAC-SHA256) —
 boshqa odam o'zini siz deb ko'rsata olmaydi. Ruxsatsiz foydalanuvchi 401 oladi.
 `?dev=1` rejimi faqat localhost'dan ishlaydi.
+Commit changes.
+
